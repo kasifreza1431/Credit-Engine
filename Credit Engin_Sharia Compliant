@@ -1,1 +1,784 @@
+"""
+Production-Grade Credit Decisioning Engine (CDE)
+Clean Architecture with Modular Layers and Shariah Compliance
+"""
 
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Dict, List, Optional, Any, Callable
+import json
+import logging
+from functools import wraps
+
+# -------------------- Domain Entities --------------------
+
+class ProductType(Enum):
+    CREDIT_CARD = "credit_card"
+    PERSONAL_LOAN = "personal_loan"
+    SME_LOAN = "sme_loan"
+    COMMERCIAL_LENDING = "commercial_lending"
+    BNPL = "bnpl"
+    MORTGAGE = "mortgage"
+
+class Decision(Enum):
+    APPROVE = "approve"
+    DECLINE = "decline"
+    REFER = "refer"
+    PENDING = "pending"
+
+class RiskLevel(Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+@dataclass
+class Applicant:
+    id: str
+    name: str
+    income: float
+    credit_score: int
+    existing_debt: float
+    employment_years: int
+    age: int
+    nationality: str
+    residence_country: str
+    business_type: Optional[str] = None  # For SME/Commercial
+    business_years: Optional[int] = None
+    requested_amount: float = 0.0
+    
+@dataclass
+class Application:
+    id: str
+    product_type: ProductType
+    applicant: Applicant
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    timestamp: datetime = field(default_factory=datetime.now)
+
+@dataclass
+class RuleResult:
+    rule_name: str
+    passed: bool
+    impact: float  # Score impact (-100 to +100)
+    message: str
+    details: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class DecisionResult:
+    application_id: str
+    decision: Decision
+    risk_score: float
+    risk_level: RiskLevel
+    rule_results: List[RuleResult]
+    approved_amount: Optional[float] = None
+    interest_rate: Optional[float] = None
+    explanations: List[str] = field(default_factory=list)
+    audit_trail: Dict[str, Any] = field(default_factory=dict)
+
+# -------------------- Audit & Logging --------------------
+
+class AuditLogger:
+    """Thread-safe audit logger with structured logging"""
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance.logger = logging.getLogger("CreditEngine")
+            cls._instance._setup_logger()
+        return cls._instance
+    
+    def _setup_logger(self):
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        handler.setFormatter(formatter)
+        self.logger.addHandler(handler)
+        self.logger.setLevel(logging.INFO)
+    
+    def log_decision(self, application_id: str, decision: Decision, 
+                     rule_results: List[RuleResult], metadata: Dict[str, Any]):
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "application_id": application_id,
+            "decision": decision.value,
+            "rule_count": len(rule_results),
+            "declined_rules": [r.rule_name for r in rule_results if not r.passed and r.impact < 0],
+            "metadata": metadata
+        }
+        self.logger.info(f"Decision made: {json.dumps(log_entry)}")
+        return log_entry
+
+# -------------------- Abstract Base Classes --------------------
+
+class Rule(ABC):
+    """Base rule interface"""
+    
+    @abstractmethod
+    def evaluate(self, application: Application, context: Dict[str, Any]) -> RuleResult:
+        pass
+    
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        pass
+    
+    @property
+    @abstractmethod
+    def rule_type(self) -> str:  # "hard" or "soft"
+        pass
+
+class RiskScorer(ABC):
+    """Base risk scorer interface"""
+    
+    @abstractmethod
+    def calculate(self, application: Application, rule_results: List[RuleResult]) -> float:
+        pass
+
+class PolicyLayer(ABC):
+    """Base policy layer interface"""
+    
+    @abstractmethod
+    def apply(self, application: Application, decision: DecisionResult) -> DecisionResult:
+        pass
+
+# -------------------- Rule Implementations --------------------
+
+class HardRule(Rule):
+    """Base class for hard decline rules"""
+    
+    def __init__(self, name: str, condition: Callable[[Application], bool], 
+                 message: str, priority: int = 10):
+        self._name = name
+        self._condition = condition
+        self._message = message
+        self.priority = priority
+    
+    @property
+    def name(self) -> str:
+        return self._name
+    
+    @property
+    def rule_type(self) -> str:
+        return "hard"
+    
+    def evaluate(self, application: Application, context: Dict[str, Any]) -> RuleResult:
+        passed = not self._condition(application)
+        return RuleResult(
+            rule_name=self.name,
+            passed=passed,
+            impact=-100.0 if not passed else 0.0,
+            message=self._message if not passed else f"{self.name} passed",
+            details={"priority": self.priority}
+        )
+
+class SoftRule(Rule):
+    """Base class for soft scoring rules"""
+    
+    def __init__(self, name: str, scorer: Callable[[Application], float], 
+                 weight: float = 1.0):
+        self._name = name
+        self._scorer = scorer
+        self.weight = weight
+    
+    @property
+    def name(self) -> str:
+        return self._name
+    
+    @property
+    def rule_type(self) -> str:
+        return "soft"
+    
+    def evaluate(self, application: Application, context: Dict[str, Any]) -> RuleResult:
+        score_impact = self._scorer(application) * self.weight
+        return RuleResult(
+            rule_name=self.name,
+            passed=True,  # Soft rules don't decline
+            impact=score_impact,
+            message=f"{self.name} impact: {score_impact:.2f}",
+            details={"weight": self.weight}
+        )
+
+# Factory for creating rules
+class RuleFactory:
+    """Factory pattern for rule creation"""
+    
+    _rules: Dict[str, type] = {}
+    
+    @classmethod
+    def register(cls, name: str, rule_class: type):
+        cls._rules[name] = rule_class
+    
+    @classmethod
+    def create_rule(cls, rule_type: str, **kwargs) -> Rule:
+        if rule_type == "hard":
+            return HardRule(**kwargs)
+        elif rule_type == "soft":
+            return SoftRule(**kwargs)
+        else:
+            raise ValueError(f"Unknown rule type: {rule_type}")
+
+# -------------------- Rule Engine --------------------
+
+class RuleEngine:
+    """Core rule engine with strategy pattern"""
+    
+    def __init__(self):
+        self.hard_rules: List[HardRule] = []
+        self.soft_rules: List[SoftRule] = []
+        self.audit_logger = AuditLogger()
+    
+    def add_rule(self, rule: Rule):
+        if rule.rule_type == "hard":
+            self.hard_rules.append(rule)
+            # Sort by priority (lower number = higher priority)
+            self.hard_rules.sort(key=lambda x: getattr(x, 'priority', 999))
+        else:
+            self.soft_rules.append(rule)
+    
+    def execute(self, application: Application, context: Dict[str, Any]) -> List[RuleResult]:
+        results = []
+        
+        # Execute hard rules first (fail fast)
+        for rule in self.hard_rules:
+            result = rule.evaluate(application, context)
+            results.append(result)
+            
+            # If any hard rule fails, stop execution
+            if not result.passed:
+                break
+        
+        # Execute soft rules if no hard failures
+        if all(r.passed for r in results):
+            for rule in self.soft_rules:
+                results.append(rule.evaluate(application, context))
+        
+        self.audit_logger.log_decision(
+            application.id, 
+            Decision.DECLINE if any(not r.passed for r in results) else Decision.PENDING,
+            results,
+            {"rule_engine": "executed"}
+        )
+        
+        return results
+
+# -------------------- Risk Scoring Layer --------------------
+
+class DefaultRiskScorer(RiskScorer):
+    """Standard risk scoring implementation"""
+    
+    def calculate(self, application: Application, rule_results: List[RuleResult]) -> float:
+        base_score = 100.0
+        
+        # Apply all rule impacts
+        for result in rule_results:
+            base_score += result.impact
+        
+        # Normalize to 0-1000 range
+        normalized_score = max(0, min(1000, base_score))
+        return normalized_score
+
+class SMEBusinessRiskScorer(RiskScorer):
+    """Specialized scorer for SME loans"""
+    
+    def calculate(self, application: Application, rule_results: List[RuleResult]) -> float:
+        base_score = 100.0
+        
+        # SME specific adjustments
+        if application.applicant.business_years:
+            # Business longevity bonus
+            base_score += min(200, application.applicant.business_years * 20)
+        
+        # Apply rule impacts
+        for result in rule_results:
+            base_score += result.impact
+        
+        return max(0, min(1000, base_score))
+
+# -------------------- Product Policy Layer --------------------
+
+class ProductPolicy:
+    """Product-specific policies"""
+    
+    def __init__(self, product_type: ProductType, min_income: float, 
+                 max_amount: float, min_credit_score: int):
+        self.product_type = product_type
+        self.min_income = min_income
+        self.max_amount = max_amount
+        self.min_credit_score = min_credit_score
+    
+    def validate(self, application: Application) -> Optional[str]:
+        if application.applicant.income < self.min_income:
+            return f"Income {application.applicant.income} below minimum {self.min_income}"
+        
+        if application.applicant.requested_amount > self.max_amount:
+            return f"Requested amount exceeds maximum {self.max_amount}"
+        
+        if application.applicant.credit_score < self.min_credit_score:
+            return f"Credit score below minimum {self.min_credit_score}"
+        
+        return None
+
+class ProductPolicyLayer(PolicyLayer):
+    """Manages product-specific policies"""
+    
+    def __init__(self):
+        self.policies: Dict[ProductType, ProductPolicy] = {}
+        self._init_default_policies()
+    
+    def _init_default_policies(self):
+        self.policies[ProductType.CREDIT_CARD] = ProductPolicy(
+            ProductType.CREDIT_CARD, 15000, 50000, 650
+        )
+        self.policies[ProductType.PERSONAL_LOAN] = ProductPolicy(
+            ProductType.PERSONAL_LOAN, 20000, 100000, 600
+        )
+        self.policies[ProductType.SME_LOAN] = ProductPolicy(
+            ProductType.SME_LOAN, 50000, 5000000, 500
+        )
+        self.policies[ProductType.COMMERCIAL_LENDING] = ProductPolicy(
+            ProductType.COMMERCIAL_LENDING, 100000, 50000000, 600
+        )
+        self.policies[ProductType.BNPL] = ProductPolicy(
+            ProductType.BNPL, 0, 5000, 400
+        )
+        self.policies[ProductType.MORTGAGE] = ProductPolicy(
+            ProductType.MORTGAGE, 50000, 20000000, 700
+        )
+    
+    def apply(self, application: Application, decision: DecisionResult) -> DecisionResult:
+        policy = self.policies.get(application.product_type)
+        if not policy:
+            decision.explanations.append(f"No policy found for {application.product_type.value}")
+            return decision
+        
+        validation_error = policy.validate(application)
+        if validation_error:
+            decision.decision = Decision.DECLINE
+            decision.explanations.append(f"Policy violation: {validation_error}")
+            
+            # Add as a rule result for audit
+            decision.rule_results.append(RuleResult(
+                rule_name=f"Policy_{application.product_type.value}",
+                passed=False,
+                impact=-100.0,
+                message=validation_error,
+                details={"policy": str(policy)}
+            ))
+        
+        return decision
+
+# -------------------- Decision Aggregation Layer --------------------
+
+class DecisionAggregator:
+    """Aggregates all inputs to make final decision"""
+    
+    def __init__(self, risk_scorer: RiskScorer):
+        self.risk_scorer = risk_scorer
+        self.audit_logger = AuditLogger()
+    
+    def aggregate(self, application: Application, rule_results: List[RuleResult],
+                  policy_results: DecisionResult) -> DecisionResult:
+        
+        # Calculate risk score
+        risk_score = self.risk_scorer.calculate(application, rule_results)
+        
+        # Determine risk level
+        if risk_score >= 800:
+            risk_level = RiskLevel.LOW
+        elif risk_score >= 600:
+            risk_level = RiskLevel.MEDIUM
+        elif risk_score >= 400:
+            risk_level = RiskLevel.HIGH
+        else:
+            risk_level = RiskLevel.CRITICAL
+        
+        # Determine final decision
+        if any(not r.passed for r in rule_results if r.rule_type == "hard"):
+            decision = Decision.DECLINE
+            approved_amount = 0
+            interest_rate = None
+        elif policy_results.decision == Decision.DECLINE:
+            decision = Decision.DECLINE
+            approved_amount = 0
+            interest_rate = None
+        elif risk_level in [RiskLevel.LOW, RiskLevel.MEDIUM]:
+            decision = Decision.APPROVE
+            # Calculate approved amount (simplified)
+            approved_amount = min(
+                application.applicant.requested_amount,
+                application.applicant.income * 3
+            )
+            # Risk-based pricing
+            interest_rate = 0.05 + (risk_level.value * 0.02)
+        elif risk_level == RiskLevel.HIGH:
+            decision = Decision.REFER
+            approved_amount = None
+            interest_rate = None
+        else:
+            decision = Decision.DECLINE
+            approved_amount = 0
+            interest_rate = None
+        
+        # Build explanations
+        explanations = []
+        for result in rule_results:
+            explanations.append(f"{result.rule_name}: {result.message}")
+        
+        final_result = DecisionResult(
+            application_id=application.id,
+            decision=decision,
+            risk_score=risk_score,
+            risk_level=risk_level,
+            rule_results=rule_results + policy_results.rule_results,
+            approved_amount=approved_amount,
+            interest_rate=interest_rate,
+            explanations=explanations,
+            audit_trail={
+                "timestamp": datetime.now().isoformat(),
+                "risk_scorer": type(self.risk_scorer).__name__
+            }
+        )
+        
+        self.audit_logger.log_decision(
+            application.id, decision, final_result.rule_results, final_result.audit_trail
+        )
+        
+        return final_result
+
+# -------------------- Sharia Compliance Layer (Decorator) --------------------
+
+class ShariaComplianceMode(Enum):
+    OFF = "off"
+    SCREENING_ONLY = "screening_only"
+    STRICT = "strict"
+
+class ShariaComplianceDecorator:
+    """Decorator pattern for Sharia compliance wrapper"""
+    
+    def __init__(self, credit_engine, mode: ShariaComplianceMode = ShariaComplianceMode.STRICT):
+        self.credit_engine = credit_engine
+        self.mode = mode
+        self.audit_logger = AuditLogger()
+        
+        # Forbidden business types (simplified)
+        self.forbidden_business_types = {
+            "alcohol", "gambling", "pork", "tobacco", 
+            "weapons", "interest_based_financial"
+        }
+        
+        # Products requiring screening
+        self.screened_products = {
+            ProductType.SME_LOAN, ProductType.COMMERCIAL_LENDING
+        }
+    
+    def _apply_screening(self, application: Application) -> Optional[str]:
+        """Apply Sharia screening filters"""
+        
+        # Check business type for SME/Commercial
+        if application.product_type in self.screened_products:
+            business_type = application.applicant.business_type
+            if business_type and business_type.lower() in self.forbidden_business_types:
+                return f"Forbidden business activity: {business_type}"
+        
+        # Check product-specific rules
+        if application.product_type == ProductType.MORTGAGE:
+            # No interest-based mortgages (simplified)
+            return "Interest-based mortgages not permitted"
+        
+        if application.product_type == ProductType.CREDIT_CARD:
+            # No late fees/interest
+            if application.metadata.get("has_interest", True):
+                return "Interest-based credit cards not permitted"
+        
+        return None
+    
+    def _apply_modifications(self, decision: DecisionResult) -> DecisionResult:
+        """Apply Sharia-compliant modifications to decision"""
+        if decision.approved_amount and decision.interest_rate:
+            # Convert to profit rate or fee structure (simplified)
+            decision.interest_rate = None
+            decision.metadata = getattr(decision, 'metadata', {})
+            decision.metadata["profit_rate"] = 0.03  # Fixed profit rate
+            decision.metadata["sharia_compliant"] = True
+            
+            # Add explanation
+            decision.explanations.append(
+                "Converted to Sharia-compliant profit-based structure"
+            )
+        
+        return decision
+    
+    def evaluate(self, application: Application) -> DecisionResult:
+        """Decorated evaluation with Sharia compliance"""
+        
+        # Apply screening
+        screening_error = self._apply_screening(application)
+        if screening_error:
+            self.audit_logger.log_decision(
+                application.id, 
+                Decision.DECLINE, 
+                [],
+                {"sharia_screening": screening_error}
+            )
+            
+            if self.mode == ShariaComplianceMode.STRICT:
+                return DecisionResult(
+                    application_id=application.id,
+                    decision=Decision.DECLINE,
+                    risk_score=0,
+                    risk_level=RiskLevel.CRITICAL,
+                    rule_results=[],
+                    explanations=[f"Sharia compliance: {screening_error}"],
+                    audit_trail={"sharia_screening": screening_error}
+                )
+            elif self.mode == ShariaComplianceMode.SCREENING_ONLY:
+                # Log but don't block
+                pass
+        
+        # Proceed with normal evaluation
+        decision = self.credit_engine.evaluate(application)
+        
+        # Apply modifications if needed
+        if self.mode != ShariaComplianceMode.OFF:
+            decision = self._apply_modifications(decision)
+            decision.audit_trail["sharia_mode"] = self.mode.value
+        
+        return decision
+
+# -------------------- Main Credit Engine --------------------
+
+class CreditDecisionEngine:
+    """Main orchestration engine - Facade pattern"""
+    
+    def __init__(self):
+        self.rule_engine = RuleEngine()
+        self.product_policy = ProductPolicyLayer()
+        self.risk_scorer = DefaultRiskScorer()
+        self.decision_aggregator = DecisionAggregator(self.risk_scorer)
+        self.audit_logger = AuditLogger()
+        
+        # Register default rules
+        self._register_default_rules()
+    
+    def _register_default_rules(self):
+        # Hard rules
+        self.rule_engine.add_rule(RuleFactory.create_rule(
+            "hard",
+            name="Minimum Age",
+            condition=lambda a: a.applicant.age < 18,
+            message="Applicant under minimum age (18)"
+        ))
+        
+        self.rule_engine.add_rule(RuleFactory.create_rule(
+            "hard",
+            name="Maximum Age",
+            condition=lambda a: a.applicant.age > 65 and a.product_type != ProductType.MORTGAGE,
+            message="Applicant over maximum age"
+        ))
+        
+        self.rule_engine.add_rule(RuleFactory.create_rule(
+            "hard",
+            name="Bankruptcy Check",
+            condition=lambda a: a.metadata.get("has_bankruptcy", False),
+            message="Applicant has bankruptcy record"
+        ))
+        
+        # Soft rules
+        self.rule_engine.add_rule(RuleFactory.create_rule(
+            "soft",
+            name="Income Stability",
+            scorer=lambda a: min(100, a.applicant.employment_years * 10),
+            weight=1.5
+        ))
+        
+        self.rule_engine.add_rule(RuleFactory.create_rule(
+            "soft",
+            name="Debt-to-Income",
+            scorer=lambda a: max(-200, - (a.applicant.existing_debt / a.applicant.income) * 100),
+            weight=2.0
+        ))
+        
+        self.rule_engine.add_rule(RuleFactory.create_rule(
+            "soft",
+            name="Credit Score",
+            scorer=lambda a: (a.applicant.credit_score - 300) / 3,
+            weight=1.0
+        ))
+    
+    def set_risk_scorer(self, scorer: RiskScorer):
+        """Strategy pattern - change risk scorer"""
+        self.risk_scorer = scorer
+        self.decision_aggregator = DecisionAggregator(scorer)
+    
+    def evaluate(self, application: Application) -> DecisionResult:
+        """Main evaluation flow"""
+        
+        # Step 1: Execute rules
+        rule_results = self.rule_engine.execute(application, {})
+        
+        # Step 2: Apply product policies
+        interim_decision = DecisionResult(
+            application_id=application.id,
+            decision=Decision.PENDING,
+            risk_score=0,
+            risk_level=RiskLevel.LOW,
+            rule_results=rule_results
+        )
+        policy_result = self.product_policy.apply(application, interim_decision)
+        
+        # Step 3: Aggregate and make final decision
+        final_decision = self.decision_aggregator.aggregate(
+            application, rule_results, policy_result
+        )
+        
+        return final_decision
+
+# -------------------- Example Usage --------------------
+
+def example_usage():
+    """Demonstrate the credit decisioning engine"""
+    
+    # Create engine
+    engine = CreditDecisionEngine()
+    
+    # Example 1: Credit Card Application
+    print("\n" + "="*50)
+    print("EXAMPLE 1: Credit Card Application")
+    print("="*50)
+    
+    app1 = Application(
+        id="APP001",
+        product_type=ProductType.CREDIT_CARD,
+        applicant=Applicant(
+            id="C001",
+            name="John Doe",
+            income=60000,
+            credit_score=720,
+            existing_debt=15000,
+            employment_years=5,
+            age=35,
+            nationality="US",
+            residence_country="US",
+            requested_amount=10000
+        ),
+        metadata={"has_bankruptcy": False}
+    )
+    
+    result1 = engine.evaluate(app1)
+    print(f"Decision: {result1.decision.value}")
+    print(f"Risk Score: {result1.risk_score:.0f}")
+    print(f"Risk Level: {result1.risk_level.value}")
+    print(f"Approved Amount: ${result1.approved_amount:,.0f}")
+    print(f"Interest Rate: {result1.interest_rate:.2%}")
+    print("\nExplanations:")
+    for exp in result1.explanations[:3]:
+        print(f"  - {exp}")
+    
+    # Example 2: SME Loan with specialized scorer
+    print("\n" + "="*50)
+    print("EXAMPLE 2: SME Loan Application")
+    print("="*50)
+    
+    # Switch to SME scorer
+    engine.set_risk_scorer(SMEBusinessRiskScorer())
+    
+    app2 = Application(
+        id="APP002",
+        product_type=ProductType.SME_LOAN,
+        applicant=Applicant(
+            id="C002",
+            name="Tech Startup Ltd",
+            income=250000,
+            credit_score=680,
+            existing_debt=50000,
+            employment_years=5,  # Owner experience
+            age=42,
+            nationality="UK",
+            residence_country="UK",
+            business_type="Technology",
+            business_years=3,
+            requested_amount=500000
+        ),
+        metadata={"has_bankruptcy": False}
+    )
+    
+    result2 = engine.evaluate(app2)
+    print(f"Decision: {result2.decision.value}")
+    print(f"Risk Score: {result2.risk_score:.0f}")
+    print(f"Risk Level: {result2.risk_level.value}")
+    print(f"Approved Amount: ${result2.approved_amount:,.0f}")
+    print(f"Interest Rate: {result2.interest_rate:.2%}")
+    
+    # Example 3: Sharia-compliant processing
+    print("\n" + "="*50)
+    print("EXAMPLE 3: Sharia-Compliant Mortgage")
+    print("="*50)
+    
+    # Wrap engine with Sharia compliance
+    sharia_engine = ShariaComplianceDecorator(
+        engine, 
+        mode=ShariaComplianceMode.STRICT
+    )
+    
+    app3 = Application(
+        id="APP003",
+        product_type=ProductType.MORTGAGE,
+        applicant=Applicant(
+            id="C003",
+            name="Ahmed Khan",
+            income=120000,
+            credit_score=750,
+            existing_debt=200000,
+            employment_years=8,
+            age=38,
+            nationality="UAE",
+            residence_country="UAE",
+            requested_amount=800000
+        ),
+        metadata={"has_interest": True}
+    )
+    
+    result3 = sharia_engine.evaluate(app3)
+    print(f"Decision: {result3.decision.value}")
+    print(f"Sharia Mode: Strict")
+    print("\nExplanations:")
+    for exp in result3.explanations:
+        print(f"  - {exp}")
+    
+    # Example 4: Declined application
+    print("\n" + "="*50)
+    print("EXAMPLE 4: Declined Application")
+    print("="*50)
+    
+    app4 = Application(
+        id="APP004",
+        product_type=ProductType.PERSONAL_LOAN,
+        applicant=Applicant(
+            id="C004",
+            name="Bad Credit",
+            income=25000,
+            credit_score=450,
+            existing_debt=30000,
+            employment_years=1,
+            age=22,
+            nationality="US",
+            residence_country="US",
+            requested_amount=50000
+        ),
+        metadata={"has_bankruptcy": True}  # Trigger hard rule
+    )
+    
+    result4 = engine.evaluate(app4)
+    print(f"Decision: {result4.decision.value}")
+    print(f"Risk Score: {result4.risk_score:.0f}")
+    print("\nDecline Reasons:")
+    for result in result4.rule_results:
+        if not result.passed:
+            print(f"  - {result.message}")
+
+if __name__ == "__main__":
+    example_usage()
